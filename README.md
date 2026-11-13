@@ -193,3 +193,7 @@ Ports are numbered from 0 in the requests and from 1 everywhere else.
   implemented but have not been exercised on real hardware.
 - Only port settings have been pushed to a real switch so far; VLAN and PVID
   changes use the forms listed above but are untested live.
+
+## Licence
+
+[MIT](LICENSE)
