@@ -1,0 +1,17 @@
+{
+	"luci-app-kpswitch": {
+		"description": "Manage the KP-9000-9XHML-X switch",
+		"read": {
+			"ubus": {
+				"kpswitch": [ "info", "ports", "vlans", "mac", "diff" ]
+			},
+			"uci": [ "kpswitch" ]
+		},
+		"write": {
+			"ubus": {
+				"kpswitch": [ "apply", "save", "import" ]
+			},
+			"uci": [ "kpswitch" ]
+		}
+	}
+}

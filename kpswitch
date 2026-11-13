@@ -1,0 +1,582 @@
+#!/bin/sh
+# kpswitch - manage a KP-9000-9XHML-X web-managed switch from OpenWrt.
+#
+# The switch only speaks its own web UI, so this script drives that UI over
+# HTTP. Desired state lives in /etc/config/kpswitch; "apply" pushes only the
+# differences to the switch.
+#
+#   kpswitch info            device model, firmware, IP
+#   kpswitch ports           link, speed, PVID and packet counters per port
+#   kpswitch vlans           802.1Q VLAN table
+#   kpswitch mac             MAC table (with DHCP hostnames where known)
+#   kpswitch json <info|ports|vlans|mac>
+#   kpswitch import [-w]     turn the switch's current state into UCI
+#                            (-w writes it to /etc/config/kpswitch)
+#   kpswitch diff            show what "apply" would change
+#   kpswitch apply           push UCI config to the switch
+#   kpswitch save            store the switch's running config to its flash
+#   kpswitch raw <page>      dump a raw page, e.g. "port.cgi?page=stats"
+#
+# Needs: curl, md5sum (both in a stock OpenWrt image with curl installed).
+
+CFG=kpswitch
+NPORTS=9
+TIMEOUT=8
+TOKEN=
+TMP=$(mktemp -d /tmp/kpswitch.XXXXXX) || exit 1
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+die() { echo "kpswitch: $*" >&2; exit 1; }
+uci_() { uci ${UCI_CONFIG_DIR:+-c "$UCI_CONFIG_DIR"} "$@"; }
+
+# ---------------------------------------------------------------- config ---
+
+load_cfg() {
+	. /lib/functions.sh
+	config_load "$CFG"
+	config_get HOST main host
+	config_get USERNAME main username admin
+	config_get PASSWORD main password
+	config_get AUTOSAVE main autosave 0
+	config_get PRUNE main prune 0
+	[ -n "$HOST" ] || [ -n "$KPSWITCH_FIXTURES" ] ||
+		die "no host set: uci set $CFG.main.host=<switch address>"
+}
+
+bool() {
+	case "$1" in
+		1|on|yes|true|enable|enabled) echo 1 ;;
+		0|off|no|false|disable|disabled) echo 0 ;;
+		'') echo '' ;;
+		*) die "bad boolean '$1'" ;;
+	esac
+}
+
+# ------------------------------------------------------------------ http ---
+
+LOGIN_MARK='location.replace("/login.cgi")'
+
+auth() {
+	[ -n "$TOKEN" ] && return
+	[ -n "$PASSWORD" ] || die "no password set: uci set $CFG.main.password=<password> && uci commit $CFG"
+	# The web UI's session cookie is md5(username + password).
+	TOKEN=$(printf '%s%s' "$USERNAME" "$PASSWORD" | md5sum | cut -d' ' -f1)
+}
+
+login() {
+	curl -s -m "$TIMEOUT" -o /dev/null -b "admin=$TOKEN" \
+		--data-urlencode "username=$USERNAME" \
+		--data-urlencode "password=$PASSWORD" \
+		-d "Response=$TOKEN" -d "language=EN" \
+		"http://$HOST/login.cgi" || die "cannot reach switch at $HOST"
+}
+
+fx() { echo "$1" | sed 's/[^A-Za-z0-9]/_/g'; }
+pg() { echo "$TMP/$(fx "$1").html"; }
+
+# fetch <page>: download into the per-run cache. Must run in the main shell.
+fetch() {
+	local f try
+	f=$(pg "$1")
+	[ -s "$f" ] && return 0
+	if [ -n "$KPSWITCH_FIXTURES" ]; then
+		cp "$KPSWITCH_FIXTURES/$(fx "$1").html" "$f" || die "no fixture for $1"
+		return 0
+	fi
+	auth
+	for try in 1 2; do
+		curl -s -m "$TIMEOUT" -b "admin=$TOKEN" -o "$f" "http://$HOST/$1" ||
+			die "cannot reach switch at $HOST"
+		grep -qF "$LOGIN_MARK" "$f" || break
+		[ "$try" = 1 ] && login
+	done
+	grep -qF "$LOGIN_MARK" "$f" && { rm -f "$f"; die "switch rejected the login (check username/password)"; }
+	[ -s "$f" ] || die "empty reply for $1"
+}
+
+# http_post <page> key=value...
+http_post() {
+	local page="$1" n try
+	shift
+	if [ -n "$KPSWITCH_FIXTURES" ]; then
+		echo "    (fixture mode, not sent) POST $page $*"
+		return 0
+	fi
+	auth
+	n=$#
+	while [ "$n" -gt 0 ]; do
+		set -- "$@" --data-urlencode "$1"
+		shift
+		n=$((n - 1))
+	done
+	for try in 1 2; do
+		curl -s -m "$TIMEOUT" -b "admin=$TOKEN" -o "$TMP/post.html" "$@" "http://$HOST/$page" ||
+			die "POST $page failed"
+		grep -qF "$LOGIN_MARK" "$TMP/post.html" || return 0
+		[ "$try" = 1 ] && login
+	done
+	die "switch rejected the login (check username/password)"
+}
+
+flush_cache() { rm -f "$TMP"/*.html "$TMP"/cur_*; }
+
+# --------------------------------------------------------------- parsing ---
+
+# One line per table row, cells separated by tabs, tags stripped.
+rows() {
+	tr '\r\n\t' '   ' < "$1" | awk '{
+		s = $0
+		gsub(/<\/t[dh]>/, "\t", s)
+		gsub(/<tr[^>]*>/, "\n", s)
+		gsub(/<[^>]*>/, "", s)
+		gsub(/&nbsp;/, " ", s)
+		n = split(s, L, "\n")
+		for (i = 1; i <= n; i++) {
+			r = L[i]
+			gsub(/ *\t */, "\t", r)
+			sub(/^ +/, "", r)
+			sub(/[\t ]+$/, "", r)
+			if (r != "") print r
+		}
+	}'
+}
+
+AWKLIB='
+function spd(s) { s = tolower(s); gsub(/[\/ m]/, "", s); sub(/half/, "h", s); sub(/full/, "f", s); return s }
+function onoff(s) { s = tolower(s); return (s == "enable" || s == "on") ? 1 : 0 }
+function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+function setr(list, val,    n, a, i, b, j) {
+	if (list == "-" || list == "") return
+	n = split(list, a, ",")
+	for (i = 1; i <= n; i++) {
+		if (split(a[i], b, "-") == 2) { for (j = b[1] + 0; j <= b[2] + 0; j++) M[j] = val }
+		else M[a[i] + 0] = val
+	}
+}
+function plist(m, want,    i, s) {
+	s = ""
+	for (i = 1; i <= length(m); i++) if (substr(m, i, 1) == want) s = s (s == "" ? "" : " ") i
+	return s
+}
+'
+
+# Internal tables use "|" as separator (empty fields must survive "read").
+
+# port|enable|speed_cfg|actual|flow_cfg|flow_actual
+t_ports() {
+	rows "$(pg port.cgi)" | awk -F'\t' "$AWKLIB"'
+		$1 ~ /^Port [0-9]+$/ && NF >= 6 {
+			sub(/^Port /, "", $1)
+			print $1 "|" onoff($2) "|" spd($3) "|" $4 "|" onoff($5) "|" onoff($6)
+		}'
+}
+
+# port|pvid|accept
+t_pvid() {
+	rows "$(pg 'vlan.cgi?page=port_based')" | awk -F'\t' '
+		$1 ~ /^Port [0-9]+$/ && NF == 3 && $2 ~ /^[0-9]+$/ {
+			sub(/^Port /, "", $1)
+			a = tolower($3)
+			a = (a ~ /^tag/) ? "tagged" : (a ~ /^untag/) ? "untagged" : "all"
+			print $1 "|" $2 "|" a
+		}'
+}
+
+# port|tx_good|tx_bad|rx_good|rx_bad
+t_stats() {
+	rows "$(pg 'port.cgi?page=stats')" | awk -F'\t' '
+		function c64(s,    a) { if (split(s, a, "-") == 2) return sprintf("%.0f", a[1] * 4294967296 + a[2]); return s + 0 }
+		$1 ~ /^Port [0-9]+$/ && NF == 7 {
+			sub(/^Port /, "", $1)
+			print $1 "|" c64($4) "|" $5 + 0 "|" c64($6) "|" $7 + 0
+		}'
+}
+
+# vid|name|membership   (one char per port: 0 untagged, 1 tagged, 2 not member)
+t_vlans() {
+	rows "$(pg 'vlan.cgi?page=static')" | awk -F'\t' -v N="$NPORTS" "$AWKLIB"'
+		$1 ~ /^[0-9]+$/ && NF >= 5 {
+			for (i = 1; i <= N; i++) M[i] = 2
+			setr($4, 1); setr($5, 0)
+			s = ""
+			for (i = 1; i <= N; i++) s = s M[i]
+			print $1 "|" $2 "|" s
+		}'
+}
+
+# no|mac|vid|type|port
+t_mac_page() {
+	rows "$1" | awk -F'\t' '
+		$2 ~ /^([0-9A-Fa-f][0-9A-Fa-f]:)+[0-9A-Fa-f][0-9A-Fa-f]$/ && NF >= 5 {
+			print $1 "|" tolower($2) "|" $3 "|" $4 "|" $5
+		}'
+}
+
+build_mac() {
+	local last n first
+	fetch 'mac.cgi?page=fwd_tbl'
+	t_mac_page "$(pg 'mac.cgi?page=fwd_tbl')" > "$TMP/cur_mac"
+	[ -n "$KPSWITCH_FIXTURES" ] && return
+	# Further pages: the UI's "Next Page" button posts cmd=nextpage, and is
+	# rendered "disabled" on the last page.
+	cp "$(pg 'mac.cgi?page=fwd_tbl')" "$TMP/post.html"
+	n=0
+	while [ "$n" -lt 50 ]; do
+		n=$((n + 1))
+		grep -q 'id=next disabled' "$TMP/post.html" && break
+		grep -q 'id=next' "$TMP/post.html" || break
+		last=$(tail -n1 "$TMP/cur_mac" | cut -d'|' -f1)
+		[ -n "$last" ] || break
+		http_post 'mac.cgi?page=fwd_tbl' "cmd=nextpage"
+		t_mac_page "$TMP/post.html" > "$TMP/mac_next"
+		first=$(head -n1 "$TMP/mac_next" | cut -d'|' -f1)
+		[ -n "$first" ] && [ "$first" -gt "$last" ] || break
+		cat "$TMP/mac_next" >> "$TMP/cur_mac"
+	done
+}
+
+build_current() {
+	fetch port.cgi
+	fetch 'vlan.cgi?page=port_based'
+	fetch 'vlan.cgi?page=static'
+	t_ports > "$TMP/cur_ports"
+	t_pvid > "$TMP/cur_pvid"
+	t_vlans > "$TMP/cur_vlans"
+	[ -s "$TMP/cur_ports" ] || die "could not parse the port table (firmware changed?)"
+	[ -s "$TMP/cur_vlans" ] || die "could not parse the VLAN table (firmware changed?)"
+}
+
+# ----------------------------------------------------------------- views ---
+
+cmd_info() {
+	fetch info.cgi
+	rows "$(pg info.cgi)" | awk -F'\t' 'NF == 2 { printf "%-18s %s\n", $1, $2 }'
+}
+
+json_info() {
+	fetch info.cgi
+	rows "$(pg info.cgi)" | awk -F'\t' "$AWKLIB"'
+		BEGIN { printf "{" }
+		NF == 2 { k = tolower($1); gsub(/ /, "_", k); printf "%s\"%s\":\"%s\"", (n++ ? "," : ""), esc(k), esc($2) }
+		END { print "}" }'
+}
+
+PORTS_AWK='
+FILENAME == ARGV[1] { en[$1] = $2; sc[$1] = $3; act[$1] = $4; fc[$1] = $5; if ($1 + 0 > max) max = $1 + 0; next }
+FILENAME == ARGV[2] { pv[$1] = $2; ac[$1] = $3; next }
+FILENAME == ARGV[3] { tx[$1] = $2; txb[$1] = $3; rx[$1] = $4; rxb[$1] = $5; next }
+function mbps(s) { s = toupper(s); if (s ~ /^10G/) return 10000; if (s ~ /^[0-9]+/) return s + 0; return 0 }
+'
+
+build_ports_view() {
+	build_current
+	fetch 'port.cgi?page=stats'
+	t_stats > "$TMP/cur_stats"
+}
+
+cmd_ports() {
+	build_ports_view
+	awk -F'|' "$PORTS_AWK"'
+		END {
+			printf "%-5s %-8s %-10s %-7s %-5s %-5s %-9s %14s %14s %7s %7s\n", "PORT", "STATE", "LINK", "CONFIG", "FLOW", "PVID", "ACCEPT", "TX_PKTS", "RX_PKTS", "TX_BAD", "RX_BAD"
+			for (p = 1; p <= max; p++)
+				printf "%-5d %-8s %-10s %-7s %-5s %-5s %-9s %14s %14s %7s %7s\n", p, (en[p] ? "enabled" : "disabled"), act[p], sc[p], (fc[p] ? "on" : "off"), pv[p], ac[p], tx[p], rx[p], txb[p], rxb[p]
+		}' "$TMP/cur_ports" "$TMP/cur_pvid" "$TMP/cur_stats"
+}
+
+json_ports() {
+	build_ports_view
+	awk -F'|' "$PORTS_AWK"'
+		END {
+			printf "{\"ports\":["
+			for (p = 1; p <= max; p++)
+				printf "%s{\"port\":%d,\"enabled\":%s,\"link\":%s,\"speed\":%d,\"actual\":\"%s\",\"speed_config\":\"%s\",\"flow_control\":%s,\"pvid\":%d,\"accept\":\"%s\",\"tx_packets\":%s,\"rx_packets\":%s,\"tx_bad\":%d,\"rx_bad\":%d}", (p > 1 ? "," : ""), p, (en[p] ? "true" : "false"), (mbps(act[p]) ? "true" : "false"), mbps(act[p]), act[p], sc[p], (fc[p] ? "true" : "false"), pv[p], ac[p], (tx[p] == "" ? 0 : tx[p]), (rx[p] == "" ? 0 : rx[p]), txb[p], rxb[p]
+			print "]}"
+		}' "$TMP/cur_ports" "$TMP/cur_pvid" "$TMP/cur_stats"
+}
+
+cmd_vlans() {
+	build_current
+	awk -F'|' "$AWKLIB"'
+		BEGIN { printf "%-6s %-18s %-22s %s\n", "VLAN", "NAME", "UNTAGGED", "TAGGED" }
+		{ u = plist($3, "0"); t = plist($3, "1"); printf "%-6s %-18s %-22s %s\n", $1, ($2 == "" ? "-" : $2), (u == "" ? "-" : u), (t == "" ? "-" : t) }' "$TMP/cur_vlans"
+}
+
+json_vlans() {
+	build_current
+	awk -F'|' "$AWKLIB"'
+		function arr(s) { gsub(/ /, ",", s); return "[" s "]" }
+		BEGIN { printf "{\"vlans\":[" }
+		{ printf "%s{\"vid\":%d,\"name\":\"%s\",\"untagged\":%s,\"tagged\":%s}", (NR > 1 ? "," : ""), $1, esc($2), arr(plist($3, "0")), arr(plist($3, "1")) }
+		END { print "]}" }' "$TMP/cur_vlans"
+}
+
+LEASES=/tmp/dhcp.leases
+MAC_AWK='
+FILENAME == L { host[tolower($2)] = ($4 == "*" ? "" : $4); ip[tolower($2)] = $3; next }
+'
+
+cmd_mac() {
+	build_mac
+	[ -r "$LEASES" ] || LEASES=/dev/null
+	awk -v L="$LEASES" "$MAC_AWK"'
+		BEGIN { printf "%-19s %-5s %-5s %-9s %-16s %s\n", "MAC", "VLAN", "PORT", "TYPE", "IP", "HOST" }
+		{ split($0, f, "|"); printf "%-19s %-5s %-5s %-9s %-16s %s\n", f[2], f[3], f[5], f[4], ip[f[2]], host[f[2]] }' "$LEASES" "$TMP/cur_mac"
+}
+
+json_mac() {
+	build_mac
+	[ -r "$LEASES" ] || LEASES=/dev/null
+	awk -v L="$LEASES" "$AWKLIB$MAC_AWK"'
+		BEGIN { printf "{\"entries\":[" }
+		{ split($0, f, "|"); printf "%s{\"mac\":\"%s\",\"vid\":%d,\"port\":%d,\"type\":\"%s\",\"ip\":\"%s\",\"host\":\"%s\"}", (n++ ? "," : ""), f[2], f[3], f[5], esc(f[4]), ip[f[2]], esc(host[f[2]]) }
+		END { print "]}" }' "$LEASES" "$TMP/cur_mac"
+}
+
+# ---------------------------------------------------------------- import ---
+
+cmd_import() {
+	local write=0
+	[ "$1" = "-w" ] && write=1
+	build_current
+	{
+		_del() { echo "delete $CFG.$1"; }
+		config_foreach _del port
+		config_foreach _del vlan
+		awk -F'|' -v C="$CFG" "$AWKLIB"'
+			function lst(sec, opt, s,    n, a, i) { n = split(s, a, " "); for (i = 1; i <= n; i++) printf "add_list %s.%s.%s=\047%s\047\n", C, sec, opt, a[i] }
+			{
+				sec = "vlan" $1
+				printf "set %s.%s=vlan\nset %s.%s.vid=\047%s\047\n", C, sec, C, sec, $1
+				if ($2 != "") printf "set %s.%s.name=\047%s\047\n", C, sec, $2
+				lst(sec, "untagged", plist($3, "0")); lst(sec, "tagged", plist($3, "1"))
+			}' "$TMP/cur_vlans"
+		awk -F'|' -v C="$CFG" '
+			FILENAME == ARGV[1] { pv[$1] = $2; ac[$1] = $3; next }
+			{
+				sec = "port" $1
+				printf "set %s.%s=port\n", C, sec
+				printf "set %s.%s.port=\047%s\047\n", C, sec, $1
+				printf "set %s.%s.enable=\047%s\047\n", C, sec, $2
+				printf "set %s.%s.speed=\047%s\047\n", C, sec, $3
+				printf "set %s.%s.flow=\047%s\047\n", C, sec, $5
+				printf "set %s.%s.pvid=\047%s\047\n", C, sec, pv[$1]
+				printf "set %s.%s.accept=\047%s\047\n", C, sec, ac[$1]
+			}' "$TMP/cur_pvid" "$TMP/cur_ports"
+	} > "$TMP/import.uci"
+	if [ "$write" = 1 ]; then
+		uci_ batch < "$TMP/import.uci" >/dev/null || die "uci batch failed"
+		uci_ commit "$CFG"
+		echo "imported $(wc -l < "$TMP/cur_vlans" | tr -d ' ') VLANs and $(wc -l < "$TMP/cur_ports" | tr -d ' ') ports into /etc/config/$CFG"
+	else
+		cat "$TMP/import.uci"
+		echo "# preview only: run 'kpswitch import -w' to write this to /etc/config/$CFG" >&2
+	fi
+}
+
+# ----------------------------------------------------------------- apply ---
+
+speed_code() { # <speed> <port>
+	local c
+	case "$1" in
+		auto) c=0 ;; 10h) c=1 ;; 10f) c=2 ;; 100h) c=3 ;; 100f) c=4 ;;
+		1000f) c=5 ;; 2500f) c=6 ;; 10gf) c=8 ;;
+		*) return 1 ;;
+	esac
+	if [ "$2" = 9 ]; then
+		case "$c" in 0|4|5|6|8) ;; *) return 1 ;; esac
+	else
+		[ "$c" -le 6 ] || return 1
+	fi
+	echo "$c"
+}
+
+accept_code() {
+	case "$1" in all) echo 0 ;; tagged) echo 1 ;; untagged) echo 2 ;; *) return 1 ;; esac
+}
+
+mdesc() { # membership string -> "untagged=1 tagged=8"
+	echo "$1" | awk "$AWKLIB"'{ u = plist($0, "0"); t = plist($0, "1"); printf "untagged=[%s] tagged=[%s]", u, t }'
+}
+
+_des_vlan() {
+	local vid name t u s i
+	config_get vid "$1" vid
+	config_get name "$1" name
+	config_get t "$1" tagged
+	config_get u "$1" untagged
+	case "$vid" in ''|*[!0-9]*) die "vlan section '$1': bad vid '$vid'" ;; esac
+	[ "$vid" -ge 1 ] && [ "$vid" -le 4094 ] || die "vlan section '$1': vid out of range"
+	case "$name" in *'|'*|*"'"*) die "vlan $vid: name may not contain | or '" ;; esac
+	[ "${#name}" -le 16 ] || die "vlan $vid: name longer than 16 characters"
+	s=
+	i=1
+	while [ "$i" -le "$NPORTS" ]; do
+		case " $t " in
+			*" $i "*)
+				case " $u " in *" $i "*) die "vlan $vid: port $i is both tagged and untagged" ;; esac
+				s="${s}1" ;;
+			*) case " $u " in *" $i "*) s="${s}0" ;; *) s="${s}2" ;; esac ;;
+		esac
+		i=$((i + 1))
+	done
+	echo "$vid|$name|$s" >> "$TMP/des_vlans"
+}
+
+_des_port() {
+	local p en sp fl pv ac
+	config_get p "$1" port
+	config_get en "$1" enable
+	config_get sp "$1" speed
+	config_get fl "$1" flow
+	config_get pv "$1" pvid
+	config_get ac "$1" accept
+	case "$p" in [1-9]) ;; *) die "port section '$1': bad port '$p'" ;; esac
+	[ "$p" -le "$NPORTS" ] || die "port section '$1': no port $p"
+	en=$(bool "$en") || exit 1
+	fl=$(bool "$fl") || exit 1
+	echo "$p|$en|$sp|$fl|$pv|$ac" >> "$TMP/des_ports"
+}
+
+build_desired() {
+	: > "$TMP/des_vlans"
+	: > "$TMP/des_ports"
+	config_foreach _des_vlan vlan
+	config_foreach _des_port port
+}
+
+change() { CHANGES=$((CHANGES + 1)); echo "  $1"; }
+
+# plan <show|do>: walk the differences between UCI and the switch.
+plan() {
+	local mode="$1" vid name mstr cur i p en sp fl pv ac c code
+	CHANGES=0
+	build_desired
+	build_current
+
+	while IFS='|' read -r vid name mstr; do
+		cur=$(awk -F'|' -v v="$vid" '$1 == v { print $2 "|" $3 }' "$TMP/cur_vlans")
+		[ "$cur" = "$name|$mstr" ] && continue
+		if [ -z "$cur" ]; then
+			change "vlan $vid: create '$name' $(mdesc "$mstr")"
+		else
+			change "vlan $vid: '${cur%%|*}' $(mdesc "${cur#*|}") -> '$name' $(mdesc "$mstr")"
+		fi
+		[ "$mode" = do ] || continue
+		set -- "vid=$vid" "name=$name"
+		i=0
+		while [ "$i" -lt "$NPORTS" ]; do
+			set -- "$@" "vlanPort_$i=$(echo "$mstr" | cut -c$((i + 1)))"
+			i=$((i + 1))
+		done
+		http_post 'vlan.cgi?page=static' "$@"
+	done < "$TMP/des_vlans"
+
+	while IFS='|' read -r p en sp fl pv ac; do
+		# --- PVID / accepted frame type
+		cur=$(awk -F'|' -v p="$p" '$1 == p { print $2 "|" $3 }' "$TMP/cur_pvid")
+		[ -n "$cur" ] || die "switch reports no port $p"
+		[ -n "$pv" ] || pv=${cur%%|*}
+		[ -n "$ac" ] || ac=${cur#*|}
+		if [ "$pv|$ac" != "$cur" ]; then
+			code=$(accept_code "$ac") || die "port $p: accept must be all, tagged or untagged"
+			case "$pv" in ''|*[!0-9]*) die "port $p: bad pvid '$pv'" ;; esac
+			change "port $p: pvid/accept $cur -> $pv|$ac"
+			[ "$mode" = do ] && http_post 'vlan.cgi?page=port_based' \
+				"ports=$((p - 1))" "pvid=$pv" "vlan_accept_frame_type=$code"
+		fi
+		# --- state / speed / flow control
+		c=$(awk -F'|' -v p="$p" '$1 == p { print $2 "|" $3 "|" $5 }' "$TMP/cur_ports")
+		[ -n "$en" ] || en=$(echo "$c" | cut -d'|' -f1)
+		[ -n "$sp" ] || sp=$(echo "$c" | cut -d'|' -f2)
+		[ -n "$fl" ] || fl=$(echo "$c" | cut -d'|' -f3)
+		if [ "$en|$sp|$fl" != "$c" ]; then
+			code=$(speed_code "$sp" "$p") || die "port $p: speed '$sp' not valid (auto 10h 10f 100h 100f 1000f 2500f; port 9: auto 100f 1000f 2500f 10gf)"
+			change "port $p: enable|speed|flow $c -> $en|$sp|$fl"
+			[ "$mode" = do ] && http_post port.cgi \
+				"portid=$((p - 1))" "state=$en" "speed_duplex=$code" "flow=$fl" "submit= Apply " "cmd=port"
+		fi
+	done < "$TMP/des_ports"
+
+	if [ "$PRUNE" = 1 ]; then
+		while IFS='|' read -r vid name mstr; do
+			[ "$vid" = 1 ] && continue
+			grep -q "^$vid|" "$TMP/des_vlans" && continue
+			change "vlan $vid: delete (not in UCI, prune=1)"
+			[ "$mode" = do ] && http_post 'vlan.cgi?page=getRmvVlanEntry' "remove_$vid=on" "Delete= Delete "
+		done < "$TMP/cur_vlans"
+	fi
+	return 0
+}
+
+cmd_diff() {
+	plan show
+	[ "$CHANGES" = 0 ] && echo "switch matches /etc/config/$CFG" || echo "$CHANGES change(s) pending; run 'kpswitch apply'"
+}
+
+cmd_save() {
+	http_post save.cgi "cmd=save"
+	echo "running config saved to switch flash"
+}
+
+cmd_apply() {
+	local applied try
+	[ -s "/etc/config/$CFG" ] || [ -n "$UCI_CONFIG_DIR" ] || die "no /etc/config/$CFG"
+	echo "applying:"
+	plan do
+	applied=$CHANGES
+	if [ "$applied" = 0 ]; then
+		echo "  nothing to do, switch already matches"
+		return 0
+	fi
+	[ -n "$KPSWITCH_FIXTURES" ] && return 0
+	# The switch takes a moment to report a new setting, so re-read a few times.
+	echo "verifying:"
+	try=0
+	while :; do
+		sleep 1
+		flush_cache
+		plan show > "$TMP/verify.out"
+		[ "$CHANGES" = 0 ] && break
+		try=$((try + 1))
+		[ "$try" -ge 6 ] && break
+	done
+	cat "$TMP/verify.out"
+	if [ "$CHANGES" != 0 ]; then
+		die "$CHANGES setting(s) did not take; the switch still differs (nothing saved to flash)"
+	fi
+	echo "  ok, $applied change(s) live"
+	if [ "$AUTOSAVE" = 1 ]; then
+		cmd_save
+	else
+		echo "not saved to flash: a switch power-cycle undoes this. Run 'kpswitch save' to keep it."
+	fi
+}
+
+# ------------------------------------------------------------------ main ---
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+cmd="$1"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	''|-h|--help|help) usage 0 ;;
+esac
+load_cfg
+case "$cmd" in
+	info) cmd_info ;;
+	ports|status) cmd_ports ;;
+	vlans) cmd_vlans ;;
+	mac) cmd_mac ;;
+	json)
+		case "$1" in
+			info|ports|vlans|mac) "json_$1" ;;
+			*) die "json needs one of: info ports vlans mac" ;;
+		esac ;;
+	import) cmd_import "$@" ;;
+	diff) cmd_diff ;;
+	apply) cmd_apply ;;
+	save) cmd_save ;;
+	raw) [ -n "$1" ] || die "raw needs a page name"; fetch "$1"; cat "$(pg "$1")" ;;
+	*) usage 1 >&2 ;;
+esac

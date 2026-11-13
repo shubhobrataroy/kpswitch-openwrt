@@ -1,0 +1,41 @@
+#!/bin/sh
+# rpcd plugin: exposes the switch as the ubus object "kpswitch"
+#   ubus call kpswitch ports
+# Installed as /usr/libexec/rpcd/kpswitch
+
+. /usr/share/libubox/jshn.sh
+
+# Run a kpswitch command and return {"code":rc,"output":"...","pending":n}
+run() {
+	local out rc
+	out=$(/usr/sbin/kpswitch "$@" 2>&1)
+	rc=$?
+	json_init
+	json_add_int code "$rc"
+	json_add_string output "$out"
+	json_add_int pending "$(echo "$out" | grep -c '^  ')"
+	json_dump
+}
+
+case "$1" in
+	list)
+		echo '{"info":{},"ports":{},"vlans":{},"mac":{},"diff":{},"apply":{},"save":{},"import":{}}'
+		;;
+	call)
+		cat >/dev/null
+		case "$2" in
+			info|ports|vlans|mac)
+				if out=$(/usr/sbin/kpswitch json "$2" 2>/tmp/kpswitch.err); then
+					echo "$out"
+				else
+					json_init
+					json_add_string error "$(cat /tmp/kpswitch.err)"
+					json_dump
+				fi
+				;;
+			diff|apply|save) run "$2" ;;
+			import) run import -w ;;
+			*) echo '{"error":"unknown method"}' ;;
+		esac
+		;;
+esac

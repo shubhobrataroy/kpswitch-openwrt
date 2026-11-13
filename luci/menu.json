@@ -1,0 +1,30 @@
+{
+	"admin/network/kpswitch": {
+		"title": "Managed Switch",
+		"order": 35,
+		"action": {
+			"type": "alias",
+			"path": "admin/network/kpswitch/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-kpswitch" ],
+			"uci": { "kpswitch": true }
+		}
+	},
+	"admin/network/kpswitch/status": {
+		"title": "Status",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "kpswitch/status"
+		}
+	},
+	"admin/network/kpswitch/config": {
+		"title": "Configuration",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "kpswitch/config"
+		}
+	}
+}

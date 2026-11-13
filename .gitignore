@@ -1,0 +1,6 @@
+.DS_Store
+# never commit a filled-in config or anything pulled off a real router/switch
+/etc/
+*.local
+*.secrets*
+fixtures/
