@@ -1,7 +1,9 @@
 # kpswitch-openwrt
 
-Manage a **KP-9000-9XHML-X** web-managed switch (8 × 2.5G + 1 × 10G SFP+) from an
-OpenWrt router: a command-line tool, a ubus object and a LuCI page.
+Manage a **KeepLiNK KP-9000-9XHML-X** web-managed switch (8 × 2.5G + 1 × 10G SFP+)
+from an OpenWrt router: a command-line tool, a ubus object and a LuCI page.
+
+The switch: [product page on AliExpress](https://www.aliexpress.com/item/1005012046821834.html).
 
 The switch has no SNMP, SSH or API, only its own web interface. `kpswitch` drives
 that web interface over HTTP, so the router can hold the switch's configuration
@@ -29,7 +31,8 @@ control and the other menus of the switch.
 
 | | |
 |---|---|
-| Switch | KP-9000-9XHML-X, hardware V3.2, firmware V100.9.25 (Jan 20 2026) |
+| Switch | KeepLiNK KP-9000-9XHML-X, hardware V3.2, firmware V100.9.25 (Jan 20 2026) |
+| Bought from | [AliExpress listing](https://www.aliexpress.com/item/1005012046821834.html) (the listing also covers the PoE variant, KP-9000-9XHPML-X-AC, which is untested) |
 | Router | OpenWrt 25.12 (FriendlyWrt on a NanoPi R5S) |
 
 Many unbranded 2.5G switches share this firmware family (pages named `port.cgi`,
