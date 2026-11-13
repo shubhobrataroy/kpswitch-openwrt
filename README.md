@@ -160,7 +160,72 @@ to see the differences and push them to the switch.
   (mode 600) and is readable by LuCI administrators.
 - Change the switch's default password.
 
-## How it works
+## How does it work?
+
+The switch cannot be managed by OpenWrt natively: it is a separate box with its
+own firmware, and the only way in is the web page you would normally click
+through in a browser. `kpswitch` is a shell script on the router that does the
+same clicking for you, by sending the same HTTP requests the browser would.
+
+```mermaid
+flowchart LR
+    subgraph Router["OpenWrt router"]
+        UCI["/etc/config/kpswitch<br/>(desired ports and VLANs)"]
+        CLI["kpswitch<br/>(shell script)"]
+        RPCD["rpcd plugin<br/>ubus object 'kpswitch'"]
+        LUCI["LuCI page"]
+        LEASES["DHCP leases"]
+    end
+    SW["KP-9000-9XHML-X<br/>web interface (HTTP)"]
+    HA["Home Assistant,<br/>scripts, displays"]
+
+    LUCI -->|ubus over HTTP| RPCD
+    HA -->|ubus| RPCD
+    RPCD --> CLI
+    UCI --> CLI
+    LEASES --> CLI
+    CLI <-->|"GET pages / POST forms"| SW
+```
+
+**1. Logging in.** The switch's login page does not create a real session. It
+sets a cookie, `admin=`, to the MD5 of the username and password joined
+together, and every later request is accepted if it carries that cookie. The
+script computes the same value from the credentials in UCI and sends it with
+every request. If the switch answers with its "go to the login page" redirect,
+the script posts the login form once and retries.
+
+**2. Reading.** Status pages are plain HTML tables. The script downloads a
+page, splits it into table rows, strips the tags and keeps the rows that look
+like data (for example rows starting with `Port 3`). That turns `port.cgi`,
+`port.cgi?page=stats`, the two VLAN pages and the MAC table into simple
+internal tables, which are then printed as text or as JSON. Packet counters
+arrive as two 32-bit halves and are joined into one number. MAC addresses are
+matched against the router's DHCP leases to add an IP address and hostname.
+
+**3. Holding the configuration.** The ports and VLANs you want are stored in
+UCI on the router, like any other OpenWrt setting. `kpswitch import -w` fills
+that file from the switch's current state, so you start from what is already
+running.
+
+**4. Applying.** `kpswitch apply` reads the switch, compares it with UCI and
+builds a list of differences. For each difference it submits the same form the
+web page would: VLANs first, then PVIDs, then port settings, then (only if
+`prune` is on) VLAN deletions. Settings that already match are not sent.
+`kpswitch diff` prints the same list without sending anything.
+
+**5. Verifying.** After applying, the script reads the switch again, retrying
+for a few seconds because the switch is slow to report a new setting. If
+anything still differs it stops with an error and does not save. Only when
+everything matches, and `autosave` is on, does it ask the switch to store the
+running settings in its flash.
+
+**6. ubus and LuCI.** A small rpcd plugin wraps the script as the ubus object
+`kpswitch`. The LuCI page is client-side JavaScript that calls those ubus
+methods: the Status tab polls `ports` every 5 seconds, and its buttons call
+`diff`, `apply`, `save` and `import`. The Configuration tab is a normal LuCI
+form over the UCI file.
+
+### Requests sent to the switch
 
 | Action | Request to the switch |
 |---|---|
